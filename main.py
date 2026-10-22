@@ -270,8 +270,22 @@ Return ONLY a JSON object: {\"decisions\":[...]} with exactly one item per suppl
             payload = response.json()
         content = payload["choices"][0]["message"]["content"]
         parsed = parse_json_from_model(content)
+    except httpx.HTTPStatusError as exc:
+        print(
+            f"LLM provider HTTP status: {exc.response.status_code}",
+            flush=True,
+        )
+        print(
+            f"LLM provider error: {exc.response.text[:500]}",
+            flush=True,
+        )
+        raise RuntimeError("AI decision service failed") from exc
+
     except Exception as exc:
-        # Do not leak provider URLs, API keys, request data, or model output.
+        print(
+            f"LLM error type: {type(exc).__name__}",
+            flush=True,
+        )
         raise RuntimeError("AI decision service failed") from exc
 
     decisions = parsed.get("decisions")

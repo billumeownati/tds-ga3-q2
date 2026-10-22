@@ -310,6 +310,7 @@ Return ONLY a JSON object: {"decisions":[...]} with exactly one item per supplie
         else:
             attempt_timeout = min(LLM_TIMEOUT_SECONDS, max(3.0, remaining - 1.0))
         attempt_body = {**body, "model": model_name}
+        attempt_started = time.monotonic()
         try:
             timeout = httpx.Timeout(attempt_timeout, connect=min(5.0, attempt_timeout))
             with httpx.Client(timeout=timeout) as client:
@@ -337,12 +338,24 @@ Return ONLY a JSON object: {"decisions":[...]} with exactly one item per supplie
             expected = {x["packageId"] for x in requested}
             if set(output) != expected:
                 raise ValueError("Model did not return exactly the requested packages")
+            attempt_elapsed = time.monotonic() - attempt_started
+            total_elapsed = time.monotonic() - started
+            print(
+                f"LLM decision success; model={model_name}; packages={len(requested)}; "
+                f"attempt_seconds={attempt_elapsed:.2f}; total_seconds={total_elapsed:.2f}",
+                flush=True,
+            )
             if model_name != LLM_MODEL:
                 print(f"LLM fallback succeeded using model {model_name}", flush=True)
             return output
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
-            print(f"LLM provider HTTP status: {status}; model={model_name}", flush=True)
+            attempt_elapsed = time.monotonic() - attempt_started
+            print(
+                f"LLM provider HTTP status: {status}; model={model_name}; "
+                f"attempt_seconds={attempt_elapsed:.2f}; total_seconds={time.monotonic() - started:.2f}",
+                flush=True,
+            )
             # Log only a short provider error body; never log headers or secrets.
             try:
                 print(f"LLM provider error: {exc.response.text[:500]}", flush=True)
@@ -354,7 +367,12 @@ Return ONLY a JSON object: {"decisions":[...]} with exactly one item per supplie
             if status not in {408, 429, 500, 502, 503, 504}:
                 raise RuntimeError("AI decision service failed") from exc
         except (httpx.TimeoutException, httpx.NetworkError, ValueError, KeyError, IndexError, TypeError) as exc:
-            print(f"LLM attempt failed: {type(exc).__name__}; model={model_name}; trying fallback if budget permits", flush=True)
+            print(
+                f"LLM attempt failed: {type(exc).__name__}; model={model_name}; "
+                f"attempt_seconds={time.monotonic() - attempt_started:.2f}; "
+                f"total_seconds={time.monotonic() - started:.2f}; trying fallback if budget permits",
+                flush=True,
+            )
             last_exc = exc
 
     raise RuntimeError("AI decision service failed") from last_exc
@@ -701,7 +719,13 @@ async def send_message(request: Request) -> JSONResponse:
             return a2a_json({"error": {"code": "INVALID_REQUEST"}}, 400)
     except Exception:
         return a2a_json({"error": {"code": "INVALID_JSON"}}, 400)
+    request_started = time.monotonic()
     status_code, result = await run_in_threadpool(process_message, principal or "", body)
+    print(
+        f"A2A message:send completed; status={status_code}; "
+        f"elapsed_seconds={time.monotonic() - request_started:.2f}",
+        flush=True,
+    )
     return a2a_json(result, status_code)
 
 

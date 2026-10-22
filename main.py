@@ -72,6 +72,10 @@ LLM_MODEL = os.getenv("LLM_MODEL", "qwen3:4b").strip()
 # Fallback is used only if the primary provider/model fails transiently or
 # returns malformed JSON. Keep a different model configured for resilience.
 LLM_FALLBACK_MODEL = os.getenv("LLM_FALLBACK_MODEL", "gemini-3.5-flash-lite").strip()
+# Bump this only when decision instructions materially change. It forces one
+# fresh evaluation of cached packages under the new policy, then those decisions
+# are reused across subsequent Checks and Save.
+DECISION_CACHE_VERSION = "invoice-decision-v2"
 LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "35"))
 LLM_REQUEST_BUDGET_SECONDS = min(float(os.getenv("LLM_REQUEST_BUDGET_SECONDS", "40")), 41.0)
 
@@ -252,11 +256,20 @@ def model_decisions(batch_policy: dict[str, Any], requested: list[dict[str, Any]
 Choose exactly one action:
 - settle_invoice: invoice is valid, reconciled, and within autonomous authority.
 - request_approval: commercially valid, but outside delegated authority.
-- hold_invoice: pause payment until a specific verification is completed.
+- hold_invoice: payment pauses until a specific verification is completed.
 - reject_duplicate: the same commercial invoice was already paid. A different invoice from the same vendor is NOT a duplicate.
 - open_exception: material records conflict and require an exception workflow.
 
-Return ONLY a JSON object: {"decisions":[...]} with exactly one item per supplied package. Every item must have packageId, action, facts, evidenceRefs, rationale. facts must contain vendorName (string), invoiceNumber (string), amountMinor (integer in the currency's minor units, e.g. INR paise), currency (three-letter currency code). evidenceRefs must be an array of exactly three distinct full bracketed reference strings copied exactly from the decisive paragraph, e.g. ["[DOC-12]","[LEDGER-3]","[POLICY-4]"]. rationale must be 60-1500 characters, explicitly include the exact action token (such as settle_invoice), cite at least two of those exact bracketed references, and explain the decisive rule/evidence. Never invent missing facts or references. If material records conflict, choose open_exception rather than guessing. Do not execute actions; propose only."""
+Use this decision procedure separately for every package:
+1. Identify the current, case-specific controlling paragraph. Ignore archive examples, prior-period cases, training examples, hypothetical examples, superseded text, and negated claims, even if they contain the same action words. Prefer the evidence describing the current transaction and its applicable policy; do not blindly trust a cover sheet or a field labelled "summary".
+2. If current material records disagree about a decisive fact (such as invoice identity, amount, receipt, payment, or authority), choose open_exception and explain the conflict. Do not resolve material conflicts by guessing.
+3. If the records establish that the exact same commercial invoice (same vendor and invoice identity) was already paid, choose reject_duplicate. A payment for a different invoice from the same vendor is not a duplicate.
+4. If a specific required verification is still pending and no material contradiction already requires an exception, choose hold_invoice and name the verification that blocks payment.
+5. If the invoice is commercially valid but the amount or action exceeds delegated authority, choose request_approval. Only choose settle_invoice when the current evidence establishes validity, reconciliation, no prior payment of this same invoice, and authority to settle autonomously.
+
+Extract vendorName, invoiceNumber, amountMinor, and currency from the controlling current case facts—not from a decoy invoice, archive example, or unrelated paragraph. amountMinor is an integer in the currency's minor units (for INR, multiply rupees by 100; INR 1250.00 becomes 125000). Do not turn missing facts into guesses. Evidence references must be the exact three decisive bracketed reference IDs from the one paragraph that determines the action, not three arbitrary IDs that happen to occur elsewhere in the package. The rationale must connect those references to the action, rather than merely repeat the invoice text.
+
+Return ONLY a JSON object: {"decisions":[...]} with exactly one item per supplied package. Every item must have packageId, action, facts, evidenceRefs, rationale. facts must contain vendorName (string), invoiceNumber (string), amountMinor (integer), currency (three-letter currency code). evidenceRefs must be an array of exactly three distinct full bracketed reference strings copied exactly from the decisive paragraph, e.g. ["[DOC-12]","[LEDGER-3]","[POLICY-4]"]. rationale must be 60-1500 characters, explicitly include the exact action token (such as settle_invoice), cite at least two of those exact bracketed references, and explain how the evidence supports the chosen action. Never invent missing facts or references. Do not execute actions; propose only."""
     user_prompt = {
         "policyContext": batch_policy,
         "packages": requested,
@@ -416,7 +429,7 @@ def get_cached_or_new_decisions(
         package_id = package_identifier(package)
         if not package_id:
             raise ValueError("Every package must have packageId")
-        package_hash = sha256_text(canonical_json(package))
+        package_hash = sha256_text(DECISION_CACHE_VERSION + "\0" + canonical_json(package))
         cache_hashes[package_id] = package_hash
         cached = session.get(DecisionCacheRow, package_hash)
         if cached is None:
@@ -694,14 +707,47 @@ async def send_message(request: Request) -> JSONResponse:
 
 @app.get(f"{BASE_PATH}/tasks")
 def list_tasks(request: Request) -> JSONResponse:
+    """Return compact, owner-scoped Task summaries.
+
+    Full Task history and artifacts can contain hundreds of KiB per request.
+    Including every complete Task in this collection endpoint can exceed the
+    A2A 512 KiB response limit and make isolation probes unavailable. Individual
+    GET /tasks/{id} reads still return the complete stored Task. The list keeps
+    the newest 1,000 owner-owned summaries; summary fields are valid Task fields.
+    """
     principal, failure = authenticate_and_check(request, body_required=False)
     if failure is not None:
         return failure
     with SessionLocal() as session:
-        rows = session.scalars(
-            select(TaskRow).where(TaskRow.principal == principal).order_by(TaskRow.created_at.desc())
-        ).all()
-        tasks = [json.loads(row.task_json) for row in rows]
+        rows = session.execute(
+            select(
+                TaskRow.id.label("id"),
+                TaskRow.context_id.label("context_id"),
+                TaskRow.state.label("state"),
+                TaskRow.updated_at.label("updated_at"),
+            )
+            .where(TaskRow.principal == principal)
+            .order_by(TaskRow.created_at.desc())
+            .limit(1000)
+        ).mappings().all()
+
+    tasks = []
+    for row in rows:
+        updated_at = row["updated_at"]
+        if updated_at is None:
+            timestamp = now_iso()
+        else:
+            # SQLite can return naive datetimes; persisted naive values are UTC.
+            if updated_at.tzinfo is None:
+                updated_at = updated_at.replace(tzinfo=timezone.utc)
+            else:
+                updated_at = updated_at.astimezone(timezone.utc)
+            timestamp = updated_at.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        tasks.append({
+            "id": row["id"],
+            "contextId": row["context_id"],
+            "status": {"state": row["state"], "timestamp": timestamp},
+        })
     return a2a_json({"tasks": tasks})
 
 

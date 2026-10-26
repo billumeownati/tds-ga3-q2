@@ -257,7 +257,7 @@ def model_decisions(batch_policy: dict[str, Any], requested: list[dict[str, Any]
 
 RULES FOR CONTROLLING FACTS & REFERENCES:
 1. Locate the single, current controlling paragraph that determines the case. Discard cover sheets, summaries, archive examples from prior years, negated statements, superseded drafts, and training decoys.
-2. Extract facts (vendorName, invoiceNumber, amountMinor, currency) strictly from the current controlling transaction facts, never from decoys or archive examples. amountMinor must be an integer in minor units (e.g. INR 1,250.00 -> 125000).
+2. Facts (vendorName, invoiceNumber, amountMinor, currency) MUST ALWAYS be provided for all 5 actions. Extract them strictly from the current controlling transaction facts, never from decoys or archive examples. amountMinor is an integer in minor units (e.g. INR 1,250.00 -> 125000; INR 40,000 -> 4000000).
 3. Return exactly the three decisive bracketed reference IDs from that controlling paragraph only (e.g. ["[DOC-12]","[LEDGER-3]","[POLICY-4]"]). Never cite references from cover sheets ([COVER-...]), archive cases ([ARCH-...]), or training decoys ([TRAIN-...]).
 
 DECISION HIERARCHY (choose exactly one action):
@@ -399,28 +399,37 @@ def validate_and_normalize_decision(decision: dict[str, Any], package: dict[str,
     facts = decision.get("facts") if isinstance(decision.get("facts"), dict) else {}
     vendor = str(facts.get("vendorName") or "").strip()
     invoice = str(facts.get("invoiceNumber") or "").strip()
-    if not vendor or not invoice:
-        # Extract potential identifiers if model omitted them
-        pkg_text = canonical_json(package)
-        if not vendor:
-            v_match = re.search(r'"vendor(?:Name)?"\s*:\s*"([^"]+)"', pkg_text, re.IGNORECASE)
-            vendor = v_match.group(1).strip() if v_match else "Unknown Vendor"
-        if not invoice:
-            inv_match = re.search(r'"invoice(?:Number)?"\s*:\s*"([^"]+)"', pkg_text, re.IGNORECASE)
-            invoice = inv_match.group(1).strip() if inv_match else "INV-UNKNOWN"
+    pkg_text = canonical_json(package)
+
+    if not vendor or vendor.lower() in ("unknown", "unknown vendor"):
+        v_match = re.search(r'"vendor(?:Name)?"\s*:\s*"([^"]+)"', pkg_text, re.IGNORECASE)
+        if not v_match:
+            v_match = re.search(r'vendor\s*[:\-]?\s*([A-Za-z0-9\s.,]+?)(?:\s+(?:issued|submitted|sent|billed|invoice)|\.|,)', pkg_text, re.IGNORECASE)
+        vendor = v_match.group(1).strip() if v_match else "Unknown Vendor"
+
+    if not invoice or invoice.lower() in ("inv-unknown", "unknown"):
+        inv_match = re.search(r'"invoice(?:Number)?"\s*:\s*"([^"]+)"', pkg_text, re.IGNORECASE)
+        if not inv_match:
+            inv_match = re.search(r'invoice\s*(?:number|no\.?|#)?\s*[:\-]?\s*([A-Za-z0-9\-_]+)', pkg_text, re.IGNORECASE)
+        invoice = inv_match.group(1).strip() if inv_match else "INV-UNKNOWN"
 
     currency = str(facts.get("currency") or "").strip().upper()
     if not re.fullmatch(r"[A-Za-z]{3}", currency):
-        c_match = re.search(r'\b(INR|USD|EUR|GBP)\b', canonical_json(package))
-        currency = c_match.group(1) if c_match else "INR"
+        c_match = re.search(r'\b(INR|USD|EUR|GBP)\b', pkg_text)
+        currency = c_match.group(1).upper() if c_match else "INR"
 
     amount = facts.get("amountMinor")
     if isinstance(amount, float):
         amount = int(round(amount))
     elif isinstance(amount, str) and re.fullmatch(r"-?\d+", amount.strip()):
         amount = int(amount.strip())
-    elif not isinstance(amount, int) or isinstance(amount, bool):
-        amount = 0
+    elif not isinstance(amount, int) or isinstance(amount, bool) or amount == 0:
+        amt_match = re.search(r'(?:INR|USD|EUR|GBP|Rs\.?)\s*(\d+(?:,\d+)*(?:\.\d+)?)', pkg_text, re.IGNORECASE)
+        if amt_match:
+            raw_num = float(amt_match.group(1).replace(",", ""))
+            amount = int(round(raw_num * 100))
+        else:
+            amount = 0
 
     available_refs = sorted(list(all_bracketed_refs(package)))
     raw_refs = decision.get("evidenceRefs")

@@ -76,7 +76,7 @@ last_llm_error: str = ""
 # Bump this only when decision instructions materially change. It forces one
 # fresh evaluation of cached packages under the new policy, then those decisions
 # are reused across subsequent Checks and Save.
-DECISION_CACHE_VERSION = "invoice-decision-v3"
+DECISION_CACHE_VERSION = "invoice-decision-v4"
 LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "35"))
 LLM_REQUEST_BUDGET_SECONDS = min(float(os.getenv("LLM_REQUEST_BUDGET_SECONDS", "40")), 41.0)
 
@@ -845,13 +845,69 @@ def agent_card(request: Request) -> JSONResponse:
 
 @app.get("/healthz")
 @app.get("/a2a/healthz")
-def healthz() -> dict[str, Any]:
-    return {
+def healthz(inspect: str | None = None, limit: int = 5) -> dict[str, Any]:
+    resp: dict[str, Any] = {
         "status": "ok",
         "last_llm_error": last_llm_error,
         "llm_model": LLM_MODEL,
         "llm_base_url": LLM_BASE_URL,
+        "decision_cache_version": DECISION_CACHE_VERSION,
     }
+    if inspect:
+        try:
+            with SessionLocal() as s:
+                if inspect == "cache":
+                    rows = s.query(DecisionCacheRow).limit(limit).all()
+                    resp["cache"] = [
+                        {"package_hash": r.package_hash, "decision": json.loads(r.decision_json)}
+                        for r in rows
+                    ]
+                    resp["total_cache_count"] = s.query(DecisionCacheRow).count()
+                else:
+                    task_rows = s.query(TaskRow).order_by(TaskRow.created_at.desc()).limit(limit).all()
+                    inspected = []
+                    for tr in task_rows:
+                        t = json.loads(tr.task_json)
+                        proposals = []
+                        results = []
+                        packages = []
+                        for art in t.get("artifacts", []):
+                            for part in art.get("parts", []):
+                                if part.get("mediaType") == PROPOSAL_MIME:
+                                    proposals = part.get("data", {}).get("proposals", [])
+                        for hist in t.get("history", []):
+                            for part in hist.get("parts", []):
+                                if part.get("mediaType") == RESULT_MIME:
+                                    results = part.get("data", {}).get("results", [])
+                                elif part.get("mediaType") == CLAIM_MIME:
+                                    packages = part.get("data", {}).get("packages", [])
+                        pkg_map = {p.get("packageId"): p for p in packages}
+                        res_map = {r.get("packageId"): r for r in results}
+                        comparison = []
+                        for prop in proposals:
+                            pid = prop.get("packageId")
+                            res = res_map.get(pid, {})
+                            comparison.append({
+                                "packageId": pid,
+                                "proposed_action": prop.get("action"),
+                                "outcome": res.get("outcome"),
+                                "evidenceRefs": prop.get("evidenceRefs"),
+                                "rationale": prop.get("rationale")[:120] if prop.get("rationale") else None,
+                                "package": pkg_map.get(pid),
+                            })
+                        inspected.append({
+                            "taskId": tr.id,
+                            "created_at": tr.created_at.isoformat() if tr.created_at else None,
+                            "state": tr.state,
+                            "proposals_count": len(proposals),
+                            "accepted_count": sum(1 for r in results if r.get("outcome") == "ACCEPTED"),
+                            "rejected_count": sum(1 for r in results if r.get("outcome") == "REJECTED"),
+                            "items": comparison,
+                        })
+                    resp["tasks"] = inspected
+        except Exception as exc:
+            resp["inspect_error"] = str(exc)
+    return resp
 
 
 @app.post("/message:send")

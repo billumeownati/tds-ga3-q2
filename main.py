@@ -304,13 +304,11 @@ Return ONLY a JSON object: {"decisions":[...]} with exactly one decision object 
         url = f"{base}/chat/completions"
 
     candidates = []
+    if "googleapis.com" in LLM_BASE_URL:
+        candidates = ["gemini-3.8-flash", "gemini-3.1-flash-lite"]
     for candidate in (LLM_MODEL, LLM_FALLBACK_MODEL):
         if candidate and candidate not in candidates:
             candidates.append(candidate)
-    if "googleapis.com" in LLM_BASE_URL:
-        for fallback_gemini in ("gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.1-flash-lite"):
-            if fallback_gemini not in candidates:
-                candidates.append(fallback_gemini)
     if not candidates:
         raise RuntimeError("No AI model configured")
 

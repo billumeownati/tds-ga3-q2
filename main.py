@@ -305,7 +305,7 @@ Return ONLY a JSON object: {"decisions":[...]} with exactly one decision object 
 
     candidates = []
     if "googleapis.com" in LLM_BASE_URL:
-        candidates = ["gemini-3.8-flash", "gemini-3.1-flash-lite"]
+        candidates = ["gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-3.5-flash"]
     for candidate in (LLM_MODEL, LLM_FALLBACK_MODEL):
         if candidate and candidate not in candidates:
             candidates.append(candidate)
@@ -379,7 +379,7 @@ Return ONLY a JSON object: {"decisions":[...]} with exactly one decision object 
             status = exc.response.status_code
             attempt_elapsed = time.monotonic() - attempt_started
             err_text = exc.response.text[:500]
-            last_llm_error = f"{status} on {effective_model}: {err_text}"
+            last_llm_error = f"{last_llm_error} | {status} on {effective_model}: {err_text[:120]}"
             print(
                 f"LLM provider HTTP status: {status}; model={effective_model}; "
                 f"attempt_seconds={attempt_elapsed:.2f}; total_seconds={time.monotonic() - started:.2f}",
@@ -391,7 +391,7 @@ Return ONLY a JSON object: {"decisions":[...]} with exactly one decision object 
             if status in {401, 403}:
                 raise RuntimeError("AI authentication failed") from exc
         except (httpx.TimeoutException, httpx.NetworkError, ValueError, KeyError, IndexError, TypeError) as exc:
-            last_llm_error = f"{type(exc).__name__}: {str(exc)[:300]}"
+            last_llm_error = f"{last_llm_error} | {effective_model} {type(exc).__name__}: {str(exc)[:120]}"
             print(
                 f"LLM attempt failed: {type(exc).__name__}; model={effective_model}; "
                 f"attempt_seconds={time.monotonic() - attempt_started:.2f}; "

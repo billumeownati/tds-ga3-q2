@@ -72,6 +72,7 @@ LLM_MODEL = os.getenv("LLM_MODEL", "qwen3:4b").strip()
 # Fallback is used only if the primary provider/model fails transiently or
 # returns malformed JSON. Keep a different model configured for resilience.
 LLM_FALLBACK_MODEL = os.getenv("LLM_FALLBACK_MODEL", "gemini-1.5-flash").strip()
+last_llm_error: str = ""
 # Bump this only when decision instructions materially change. It forces one
 # fresh evaluation of cached packages under the new policy, then those decisions
 # are reused across subsequent Checks and Save.
@@ -279,6 +280,7 @@ Return ONLY a JSON object: {"decisions":[...]} with exactly one decision object 
     headers = {"Content-Type": "application/json"}
     if LLM_API_KEY:
         headers["Authorization"] = f"Bearer {LLM_API_KEY}"
+        headers["x-goog-api-key"] = LLM_API_KEY
     body = {
         "temperature": 0,
         "max_tokens": 10000,
@@ -287,11 +289,28 @@ Return ONLY a JSON object: {"decisions":[...]} with exactly one decision object 
             {"role": "user", "content": canonical_json(user_prompt)},
         ],
     }
-    url = f"{LLM_BASE_URL}/chat/completions"
+
+    base = LLM_BASE_URL.rstrip("/")
+    if base.endswith("/chat/completions"):
+        url = base
+    elif "generativelanguage.googleapis.com" in base:
+        if base.endswith("/openai"):
+            url = f"{base}/chat/completions"
+        elif "/v1beta" in base:
+            url = f"{base}/openai/chat/completions"
+        else:
+            url = f"{base}/v1beta/openai/chat/completions"
+    else:
+        url = f"{base}/chat/completions"
+
     candidates = []
     for candidate in (LLM_MODEL, LLM_FALLBACK_MODEL):
         if candidate and candidate not in candidates:
             candidates.append(candidate)
+    if "googleapis.com" in LLM_BASE_URL:
+        for fallback_gemini in ("gemini-2.5-flash", "gemini-1.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"):
+            if fallback_gemini not in candidates:
+                candidates.append(fallback_gemini)
     if not candidates:
         raise RuntimeError("No AI model configured")
 
@@ -299,6 +318,7 @@ Return ONLY a JSON object: {"decisions":[...]} with exactly one decision object 
     budget = max(10.0, LLM_REQUEST_BUDGET_SECONDS)
     deadline = started + budget
     last_exc: Exception | None = None
+    global last_llm_error
 
     for index, model_name in enumerate(candidates):
         remaining = deadline - time.monotonic()
@@ -310,7 +330,15 @@ Return ONLY a JSON object: {"decisions":[...]} with exactly one decision object 
             attempt_timeout = min(LLM_TIMEOUT_SECONDS, max(12.0, remaining - 17.0))
         else:
             attempt_timeout = min(LLM_TIMEOUT_SECONDS, max(3.0, remaining - 1.0))
-        attempt_body = {**body, "model": model_name}
+
+        effective_model = model_name
+        if "googleapis.com" in LLM_BASE_URL:
+            if effective_model.startswith("google/"):
+                effective_model = effective_model[len("google/"):]
+            if effective_model.startswith("models/"):
+                effective_model = effective_model[len("models/"):]
+
+        attempt_body = {**body, "model": effective_model}
         attempt_started = time.monotonic()
         try:
             timeout = httpx.Timeout(attempt_timeout, connect=min(5.0, attempt_timeout))
@@ -342,34 +370,32 @@ Return ONLY a JSON object: {"decisions":[...]} with exactly one decision object 
             attempt_elapsed = time.monotonic() - attempt_started
             total_elapsed = time.monotonic() - started
             print(
-                f"LLM decision success; model={model_name}; packages={len(requested)}; "
+                f"LLM decision success; model={effective_model}; packages={len(requested)}; "
                 f"attempt_seconds={attempt_elapsed:.2f}; total_seconds={total_elapsed:.2f}",
                 flush=True,
             )
-            if model_name != LLM_MODEL:
-                print(f"LLM fallback succeeded using model {model_name}", flush=True)
+            if effective_model != LLM_MODEL:
+                print(f"LLM fallback succeeded using model {effective_model}", flush=True)
             return output
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
             attempt_elapsed = time.monotonic() - attempt_started
+            err_text = exc.response.text[:500]
+            last_llm_error = f"{status} on {effective_model}: {err_text}"
             print(
-                f"LLM provider HTTP status: {status}; model={model_name}; "
+                f"LLM provider HTTP status: {status}; model={effective_model}; "
                 f"attempt_seconds={attempt_elapsed:.2f}; total_seconds={time.monotonic() - started:.2f}",
                 flush=True,
             )
-            # Log only a short provider error body; never log headers or secrets.
-            try:
-                print(f"LLM provider error: {exc.response.text[:500]}", flush=True)
-            except Exception:
-                pass
+            print(f"LLM provider error: {err_text}", flush=True)
             last_exc = exc
-            # Authentication/configuration/client errors will not improve with a
-            # fallback model. 402, 429 and server errors are transient/retryable.
-            if status not in {402, 408, 429, 500, 502, 503, 504}:
-                raise RuntimeError("AI decision service failed") from exc
+            # Authentication errors (401/403) will not improve with fallback models.
+            if status in {401, 403}:
+                raise RuntimeError("AI authentication failed") from exc
         except (httpx.TimeoutException, httpx.NetworkError, ValueError, KeyError, IndexError, TypeError) as exc:
+            last_llm_error = f"{type(exc).__name__}: {str(exc)[:300]}"
             print(
-                f"LLM attempt failed: {type(exc).__name__}; model={model_name}; "
+                f"LLM attempt failed: {type(exc).__name__}; model={effective_model}; "
                 f"attempt_seconds={time.monotonic() - attempt_started:.2f}; "
                 f"total_seconds={time.monotonic() - started:.2f}; trying fallback if budget permits",
                 flush=True,
@@ -788,8 +814,13 @@ def agent_card(request: Request) -> JSONResponse:
 
 @app.get("/healthz")
 @app.get("/a2a/healthz")
-def healthz() -> dict[str, str]:
-    return {"status": "ok"}
+def healthz() -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "last_llm_error": last_llm_error,
+        "llm_model": LLM_MODEL,
+        "llm_base_url": LLM_BASE_URL,
+    }
 
 
 @app.post("/message:send")

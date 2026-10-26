@@ -891,8 +891,7 @@ def healthz(inspect: str | None = None, limit: int = 5) -> dict[str, Any]:
                                 "packageId": pid,
                                 "proposed_action": prop.get("action"),
                                 "outcome": res.get("outcome"),
-                                "evidenceRefs": prop.get("evidenceRefs"),
-                                "rationale": prop.get("rationale")[:120] if prop.get("rationale") else None,
+                                "proposal": prop,
                                 "package": pkg_map.get(pid),
                             })
                         inspected.append({

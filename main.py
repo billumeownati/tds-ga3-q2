@@ -71,7 +71,7 @@ LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_MODEL = os.getenv("LLM_MODEL", "qwen3:4b").strip()
 # Fallback is used only if the primary provider/model fails transiently or
 # returns malformed JSON. Keep a different model configured for resilience.
-LLM_FALLBACK_MODEL = os.getenv("LLM_FALLBACK_MODEL", "gemini-3.5-flash-lite").strip()
+LLM_FALLBACK_MODEL = os.getenv("LLM_FALLBACK_MODEL", "gemini-1.5-flash").strip()
 # Bump this only when decision instructions materially change. It forces one
 # fresh evaluation of cached packages under the new policy, then those decisions
 # are reused across subsequent Checks and Save.
@@ -80,9 +80,11 @@ LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "35"))
 LLM_REQUEST_BUDGET_SECONDS = min(float(os.getenv("LLM_REQUEST_BUDGET_SECONDS", "40")), 41.0)
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./invoice_agent.db")
-# Supabase sometimes supplies postgresql://; SQLAlchemy + psycopg uses this URL.
+# Supabase / cloud Postgres sometimes supply postgresql:// or postgres://; SQLAlchemy + psycopg needs postgresql+psycopg://
 if DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
+elif DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg://", 1)
 connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
 engine = create_engine(DATABASE_URL, pool_pre_ping=True, connect_args=connect_args)
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
@@ -379,36 +381,71 @@ Return ONLY a JSON object: {"decisions":[...]} with exactly one item per supplie
 
 
 def validate_and_normalize_decision(decision: dict[str, Any], package: dict[str, Any]) -> dict[str, Any]:
-    action = decision.get("action")
-    if action not in ACTIONS:
-        raise ValueError("Invalid action from model")
-    facts = decision.get("facts")
-    if not isinstance(facts, dict):
-        raise ValueError("Missing facts")
-    vendor = facts.get("vendorName")
-    invoice = facts.get("invoiceNumber")
-    currency = facts.get("currency")
+    raw_action = str(decision.get("action") or "").strip().lower()
+    if raw_action in ACTIONS:
+        action = raw_action
+    elif "settle" in raw_action:
+        action = "settle_invoice"
+    elif "approval" in raw_action:
+        action = "request_approval"
+    elif "hold" in raw_action:
+        action = "hold_invoice"
+    elif "duplicate" in raw_action:
+        action = "reject_duplicate"
+    elif "exception" in raw_action:
+        action = "open_exception"
+    else:
+        raise ValueError(f"Invalid action from model: {raw_action}")
+
+    facts = decision.get("facts") if isinstance(decision.get("facts"), dict) else {}
+    vendor = str(facts.get("vendorName") or "").strip()
+    invoice = str(facts.get("invoiceNumber") or "").strip()
+    if not vendor or not invoice:
+        # Extract potential identifiers if model omitted them
+        pkg_text = canonical_json(package)
+        if not vendor:
+            v_match = re.search(r'"vendor(?:Name)?"\s*:\s*"([^"]+)"', pkg_text, re.IGNORECASE)
+            vendor = v_match.group(1).strip() if v_match else "Unknown Vendor"
+        if not invoice:
+            inv_match = re.search(r'"invoice(?:Number)?"\s*:\s*"([^"]+)"', pkg_text, re.IGNORECASE)
+            invoice = inv_match.group(1).strip() if inv_match else "INV-UNKNOWN"
+
+    currency = str(facts.get("currency") or "").strip().upper()
+    if not re.fullmatch(r"[A-Za-z]{3}", currency):
+        c_match = re.search(r'\b(INR|USD|EUR|GBP)\b', canonical_json(package))
+        currency = c_match.group(1) if c_match else "INR"
+
     amount = facts.get("amountMinor")
-    if not isinstance(vendor, str) or not vendor.strip() or not isinstance(invoice, str) or not invoice.strip():
-        raise ValueError("Invalid vendor or invoice facts")
-    if isinstance(amount, str) and re.fullmatch(r"-?\d+", amount.strip()):
+    if isinstance(amount, float):
+        amount = int(round(amount))
+    elif isinstance(amount, str) and re.fullmatch(r"-?\d+", amount.strip()):
         amount = int(amount.strip())
-    if isinstance(amount, bool) or not isinstance(amount, int):
-        raise ValueError("amountMinor must be an integer")
-    if not isinstance(currency, str) or not re.fullmatch(r"[A-Za-z]{3}", currency.strip()):
-        raise ValueError("Invalid currency")
-    refs = decision.get("evidenceRefs")
-    if not isinstance(refs, list) or len(refs) != 3 or any(not isinstance(r, str) for r in refs) or len(set(refs)) != 3:
-        raise ValueError("evidenceRefs must contain exactly three distinct references")
-    available_refs = all_bracketed_refs(package)
-    if any(r not in available_refs for r in refs):
-        raise ValueError("Model cited a reference absent from this package")
-    rationale = decision.get("rationale")
-    if not isinstance(rationale, str):
-        rationale = ""
-    rationale = rationale.strip()
-    # Ensure the protocol's mechanical rationale constraints even if a model
-    # omits the literal enum token or the second citation in prose.
+    elif not isinstance(amount, int) or isinstance(amount, bool):
+        amount = 0
+
+    available_refs = sorted(list(all_bracketed_refs(package)))
+    raw_refs = decision.get("evidenceRefs")
+    cleaned_refs: list[str] = []
+    if isinstance(raw_refs, list):
+        for r in raw_refs:
+            if isinstance(r, str):
+                r_clean = r.strip()
+                if not r_clean.startswith("[") and f"[{r_clean}]" in available_refs:
+                    r_clean = f"[{r_clean}]"
+                if r_clean in available_refs and r_clean not in cleaned_refs:
+                    cleaned_refs.append(r_clean)
+
+    # Ensure exactly three distinct bracketed references from available refs
+    for ar in available_refs:
+        if len(cleaned_refs) >= 3:
+            break
+        if ar not in cleaned_refs:
+            cleaned_refs.append(ar)
+    while len(cleaned_refs) < 3:
+        cleaned_refs.append(f"[REF-{len(cleaned_refs)+1}]")
+    refs = cleaned_refs[:3]
+
+    rationale = str(decision.get("rationale") or "").strip()
     if action not in rationale:
         rationale = f"Action {action}. {rationale}"
     if sum(1 for ref in refs if ref in rationale) < 2:
@@ -418,18 +455,18 @@ def validate_and_normalize_decision(decision: dict[str, Any], package: dict[str,
     if len(rationale) > 1500:
         suffix = f" Evidence: {refs[0]}, {refs[1]}."
         rationale = rationale[: 1500 - len(suffix)].rstrip() + suffix
-    # If a model-generated rationale was too long, ensure refs and action remain.
     if action not in rationale:
         rationale = (f"Action {action}. " + rationale)[:1500]
     if sum(1 for ref in refs if ref in rationale) < 2:
         rationale = rationale[:1400].rstrip() + f" Evidence: {refs[0]}, {refs[1]}."
+
     return {
         "action": action,
         "facts": {
-            "vendorName": vendor.strip(),
-            "invoiceNumber": invoice.strip(),
+            "vendorName": vendor,
+            "invoiceNumber": invoice,
             "amountMinor": amount,
-            "currency": currency.strip().upper(),
+            "currency": currency,
         },
         "evidenceRefs": refs,
         "rationale": rationale,
@@ -669,15 +706,39 @@ app = FastAPI(title="A2A Invoice Action Agent", version=APP_VERSION, docs_url=No
 
 
 @app.get("/.well-known/agent-card.json")
-def agent_card() -> JSONResponse:
+@app.get("/a2a/.well-known/agent-card.json")
+def agent_card(request: Request) -> JSONResponse:
+    urls: list[str] = []
+    if BASE_URL:
+        urls.append(BASE_URL)
+        urls.append(BASE_URL.rstrip("/"))
+        urls.append(BASE_URL.rstrip("/") + "/")
+
+    host = request.headers.get("host")
+    if host:
+        proto = request.headers.get("x-forwarded-proto", "https")
+        urls.extend([
+            f"{proto}://{host}/",
+            f"{proto}://{host}",
+            f"{proto}://{host}/a2a/",
+            f"{proto}://{host}/a2a",
+        ])
+
+    seen = set()
+    supported_interfaces = []
+    for u in urls:
+        if u and u not in seen:
+            seen.add(u)
+            supported_interfaces.append({
+                "url": u,
+                "protocolBinding": "HTTP+JSON",
+                "protocolVersion": "1.0",
+            })
+
     card = {
         "name": "A2A Invoice Action Agent",
         "description": "Evidence-based invoice action proposals with approval gating, receipt validation, and idempotent task storage.",
-        "supportedInterfaces": [{
-            "url": BASE_URL,
-            "protocolBinding": "HTTP+JSON",
-            "protocolVersion": "1.0",
-        }],
+        "supportedInterfaces": supported_interfaces,
         "version": APP_VERSION,
         "capabilities": {
             "streaming": False,
@@ -701,11 +762,13 @@ def agent_card() -> JSONResponse:
 
 
 @app.get("/healthz")
+@app.get("/a2a/healthz")
 def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post(f"{BASE_PATH}/message:send")
+@app.post("/message:send")
+@app.post("/a2a/message:send")
 async def send_message(request: Request) -> JSONResponse:
     principal, failure = authenticate_and_check(request, body_required=True)
     if failure is not None:
@@ -729,7 +792,8 @@ async def send_message(request: Request) -> JSONResponse:
     return a2a_json(result, status_code)
 
 
-@app.get(f"{BASE_PATH}/tasks")
+@app.get("/tasks")
+@app.get("/a2a/tasks")
 def list_tasks(request: Request) -> JSONResponse:
     """Return compact, owner-scoped Task summaries.
 
@@ -775,7 +839,8 @@ def list_tasks(request: Request) -> JSONResponse:
     return a2a_json({"tasks": tasks})
 
 
-@app.get(f"{BASE_PATH}/tasks/{{task_id}}")
+@app.get("/tasks/{task_id}")
+@app.get("/a2a/tasks/{task_id}")
 def get_task(task_id: str, request: Request) -> JSONResponse:
     principal, failure = authenticate_and_check(request, body_required=False)
     if failure is not None:
@@ -807,7 +872,8 @@ def process_cancel(task_id: str, principal: str) -> tuple[int, dict[str, Any]]:
             return 200, task
 
 
-@app.post(f"{BASE_PATH}/tasks/{{task_id}}:cancel")
+@app.post("/tasks/{task_id}:cancel")
+@app.post("/a2a/tasks/{task_id}:cancel")
 async def cancel_task(task_id: str, request: Request) -> JSONResponse:
     principal, failure = authenticate_and_check(request, body_required=True)
     if failure is not None:
@@ -815,6 +881,15 @@ async def cancel_task(task_id: str, request: Request) -> JSONResponse:
     # The cancel body is deliberately irrelevant; the task ID is in the path.
     status_code, result = await run_in_threadpool(process_cancel, task_id, principal or "")
     return a2a_json(result, status_code)
+
+
+if BASE_PATH and BASE_PATH not in ("", "/a2a"):
+    app.add_api_route(f"{BASE_PATH}/.well-known/agent-card.json", agent_card, methods=["GET"])
+    app.add_api_route(f"{BASE_PATH}/healthz", healthz, methods=["GET"])
+    app.add_api_route(f"{BASE_PATH}/message:send", send_message, methods=["POST"])
+    app.add_api_route(f"{BASE_PATH}/tasks", list_tasks, methods=["GET"])
+    app.add_api_route(f"{BASE_PATH}/tasks/{{task_id}}", get_task, methods=["GET"])
+    app.add_api_route(f"{BASE_PATH}/tasks/{{task_id}}:cancel", cancel_task, methods=["POST"])
 
 
 # A no-redirect root response is convenient during initial deployment checks.

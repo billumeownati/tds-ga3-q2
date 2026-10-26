@@ -68,10 +68,10 @@ if not BASE_PATH:
 # For public hosting, set these to a hosted OpenAI-compatible provider.
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://127.0.0.1:11434/v1").rstrip("/")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
-LLM_MODEL = os.getenv("LLM_MODEL", "qwen3:4b").strip()
+LLM_MODEL = os.getenv("LLM_MODEL", "gemini-3.8-flash").strip()
 # Fallback is used only if the primary provider/model fails transiently or
 # returns malformed JSON. Keep a different model configured for resilience.
-LLM_FALLBACK_MODEL = os.getenv("LLM_FALLBACK_MODEL", "gemini-1.5-flash").strip()
+LLM_FALLBACK_MODEL = os.getenv("LLM_FALLBACK_MODEL", "gemini-3.1-flash-lite").strip()
 last_llm_error: str = ""
 # Bump this only when decision instructions materially change. It forces one
 # fresh evaluation of cached packages under the new policy, then those decisions
@@ -308,7 +308,7 @@ Return ONLY a JSON object: {"decisions":[...]} with exactly one decision object 
         if candidate and candidate not in candidates:
             candidates.append(candidate)
     if "googleapis.com" in LLM_BASE_URL:
-        for fallback_gemini in ("gemini-2.5-flash", "gemini-1.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"):
+        for fallback_gemini in ("gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.1-flash-lite"):
             if fallback_gemini not in candidates:
                 candidates.append(fallback_gemini)
     if not candidates:

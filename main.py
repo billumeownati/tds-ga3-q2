@@ -364,8 +364,8 @@ Return ONLY a JSON object: {"decisions":[...]} with exactly one decision object 
                 pass
             last_exc = exc
             # Authentication/configuration/client errors will not improve with a
-            # fallback model. 429 and server errors are transient/retryable.
-            if status not in {408, 429, 500, 502, 503, 504}:
+            # fallback model. 402, 429 and server errors are transient/retryable.
+            if status not in {402, 408, 429, 500, 502, 503, 504}:
                 raise RuntimeError("AI decision service failed") from exc
         except (httpx.TimeoutException, httpx.NetworkError, ValueError, KeyError, IndexError, TypeError) as exc:
             print(
